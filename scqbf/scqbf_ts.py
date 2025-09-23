@@ -13,13 +13,13 @@ class ScQbfTabuSearch:
     def __init__(self, instance: ScQbfInstance,
                  max_iterations,
                  config: dict = {
-                    "construction_method": "traditional",  # traditional | random_plus_greedy | sampled_greedy
-                    "construction_args": (),
-                    "local_search_method": "best_improve"  # best_improve | first_improve
+                    "local_search_method": "best_improve",  # best_improve | first_improve
+                    "diversification_method": "none",  # none | infrequent_elements
                  },
                  time_limit_secs: float = None,
                  tenure: int = None,
-                 patience: int = 20,
+                 patience: int = 5000,
+                 freq_threshold: int = None,
                  debug: bool = False):
         
         
@@ -31,11 +31,13 @@ class ScQbfTabuSearch:
         self.debug = debug
         self.solve_time = 0
         self.tenure = tenure
-        self.TL = [self.FAKE] * (2 * tenure)
+        self.TL = [self.FAKE for i in range(2 * tenure)]
         self.iterations = 0
         self.evaluator = ScQbfEvaluator(instance)
         self.bestValue = float("-inf")
         self.currentValue = 0
+        self.frequecy = [0 for i in range(self.instance.n)]
+        self.freq_threshold = freq_threshold if freq_threshold is not None else self.patience
 
 
     def solve(self) -> ScQbfSolution:
@@ -58,26 +60,59 @@ class ScQbfTabuSearch:
 
         while ((self.iterations < self.max_iterations) if self.max_iterations is not None else True):
             self.iterations += 1
+
+            # if self.debug:
+            #     print(f"Iteration {self.iterations}: Current value {self.evaluator.evaluate_objfun(sol)} and best value {self.evaluator.evaluate_objfun(best_sol)}")
             
             sol = self._local_search(sol)
             
             if (self.evaluator.evaluate_objfun(sol) > self.evaluator.evaluate_objfun(best_sol)):
                 best_sol = sol
+                self.bestValue = self.evaluator.evaluate_objfun(best_sol)
                 current_patience = self.patience
+                if self.debug:
+                    print(f"New best value {self.bestValue:.3f} with solution {best_sol.elements} (iteration {self.iterations})...")
             else:
-                if current_patience is not None:
+                if current_patience is not None and current_patience > 0:
                     current_patience -= 1
-                    if current_patience <= 0:
-                        print(f"Patience exhausted, no improvement to the objective solution in {self.patience} iterations, stopping Tabu Search.")
-                        break
             
             self.solve_time = time.perf_counter() - start_time
             if self.time_limit_secs is not None and self.solve_time >= self.time_limit_secs:
                 print(f"Time limit of {self.time_limit_secs} seconds reached, stopping Tabu Search.")
                 break
+
+            self._update_frequency_counter(sol)
+            if current_patience == 0 and self.config["diversification_method"] == "infrequent_elements":
+                if self.debug:
+                    print(f"Patience exhausted. Best value {self.evaluator.evaluate_objfun(best_sol)}. Current best solution {best_sol.elements} (iteration {self.iterations})...")
+
+                filtered_counter = [self.frequecy[i] for i in range(self.instance.n) if self.frequecy[i] < self.freq_threshold]
+
+                if len(filtered_counter) > 0:
+                    filtered_counter.sort()
+                    freq_cut = filtered_counter[min(self.tenure, len(filtered_counter)-1)]
+                    infrequent_elements = [i for i in range(self.instance.n) if self.frequecy[i] <= freq_cut]
+                    random.shuffle(infrequent_elements)
+                    infrequent_elements = infrequent_elements[:min(self.tenure, len(infrequent_elements))]
+                    if self.debug:
+                        print(f"Diversifying by adding {infrequent_elements} (freq <= {freq_cut})...")
+
+                    # Adds the infrequent elements to the best solution and the Tabu List in a random order
+                    sol.elements = best_sol.elements.copy()
+                    for e in infrequent_elements:
+                        sol.elements.append(e)
+                        self.TL.append(e)
+                        self.TL.append(self.FAKE)
+                    self.TL = self.TL[-2*self.tenure:]
+
+
+                current_patience = self.patience
+                for i in range(self.instance.n):
+                    self.frequecy[i] = self.frequecy[i] // 2
             
         return best_sol
-    
+
+
     def _fix_solution(self, sol: ScQbfSolution) -> ScQbfSolution:
         """
         This function is called when the constructed solution is not feasible.
@@ -103,6 +138,7 @@ class ScQbfTabuSearch:
             raise ValueError("Could not fix the solution to be feasible")
         
         return sol
+
 
     def _constructive_heuristic(self) -> ScQbfSolution:
         return self._constructive_greedy_heuristic()
@@ -130,75 +166,6 @@ class ScQbfTabuSearch:
 
         return constructed_sol
 
-    def _constructive_heuristic_traditional(self, alpha: float) -> ScQbfSolution:
-        constructed_sol = ScQbfSolution([])
-        cl = [i for i in range(self.instance.n)] # makeCl
-
-        while not self.evaluator.is_solution_valid(constructed_sol): # Constructive Stop Criteria
-            # traditional constructive heuristic
-            rcl = []
-            min_delta = math.inf
-            max_delta = -math.inf
-            cl = [i for i in cl if i not in constructed_sol.elements] # update_cl
-            
-            for candidate_element in cl:
-                delta_objfun = self.evaluator.evaluate_insertion_delta(candidate_element, constructed_sol)
-                if delta_objfun < min_delta:
-                    min_delta = delta_objfun
-                if delta_objfun > max_delta:
-                    max_delta = delta_objfun
-            
-            # This is where we define the RCL.
-            for candidate_element in cl:
-                delta_objfun = self.evaluator.evaluate_insertion_delta(candidate_element, constructed_sol)
-                if delta_objfun >= (min_delta + alpha * (max_delta - min_delta)):
-
-                    ## ONLY add to rcl if coverage increases
-                    if self.evaluator.evaluate_insertion_delta_coverage(candidate_element, constructed_sol) > 0:
-                        rcl.append(candidate_element)
-
-            # Randomly select an element from the RCL to add to the solution
-            if rcl:
-                chosen_element = random.choice(rcl)
-                constructed_sol.elements.append(chosen_element)
-            else:
-                break
-
-        self.currentValue = self.evaluator.evaluate_objfun(constructed_sol)
-
-        return constructed_sol
-
-    def _constructive_heuristic_random_plus_greedy(self, alpha: float, p: float):
-        constructed_sol = ScQbfSolution([])
-        cl = [i for i in range(self.instance.n)] # make_cl
-
-        # Select first p elements at random
-        for _ in range(int(p * self.instance.n)):
-            cl = [i for i in cl if i not in constructed_sol.elements] # update_cl
-            constructed_sol.elements.append(random.choice(cl))
-        
-        # Continue with a purely greedy approach
-        while not self.evaluator.is_solution_valid(constructed_sol): # Constructive Stop Criteria
-            cl = [i for i in cl if i not in constructed_sol.elements] # update_cl
-            
-            best_delta = float("-inf")
-            best_cand_in = -1
-            
-            for candidate_element in cl:
-                # Only consider candidates that improve coverage and objective function
-                delta_objfun = self.evaluator.evaluate_insertion_delta(candidate_element, constructed_sol)
-                if delta_objfun > best_delta and self.evaluator.evaluate_insertion_delta_coverage(candidate_element, constructed_sol) > 0:
-                    best_cand_in = candidate_element
-                    best_delta = delta_objfun
-            
-            if best_delta > 0:
-                constructed_sol.elements.append(best_cand_in)
-            else:
-                break
-
-        return constructed_sol
-
-    ####################
 
     def _local_search(self, starting_point: ScQbfSolution) -> ScQbfSolution:
         if self.config.get("local_search_method", False) == "best_improve":
@@ -250,6 +217,8 @@ class ScQbfTabuSearch:
                         best_cand_in = cand_in
                         best_cand_out = cand_out
 
+        if self.debug:
+            print(f"[local_search]: Best improvement found! Delta: {best_delta}, in {best_cand_in}, out {best_cand_out}")
 
         # Apply the best move found and update the Tabu List
         if best_cand_in is not None:
@@ -270,16 +239,16 @@ class ScQbfTabuSearch:
         
         return sol
 
+
     def _local_search_first_improve(self, starting_point: ScQbfSolution) -> ScQbfSolution:
         sol = ScQbfSolution(starting_point.elements.copy())
         
         cl = [i for i in range(self.instance.n) if i not in sol.elements]
         current_elements = sol.elements.copy()
+        neighborhoods = ['insertion', 'removal', 'exchange']
 
         random.shuffle(cl)
         random.shuffle(current_elements)
-
-        neighborhoods = ['insertion', 'removal', 'exchange']
         random.shuffle(neighborhoods)
 
         best_delta = float("-inf")
@@ -348,7 +317,7 @@ class ScQbfTabuSearch:
             if move_found:
                 break
 
-        # Apply the best move found and update the Tabu List
+        # Apply the first improving move (or best move in case all deltas <= 0) found and update the Tabu List
         if best_cand_in is not None:
             sol.elements.append(best_cand_in)
             self.TL.append(best_cand_in)
@@ -366,3 +335,9 @@ class ScQbfTabuSearch:
         self.currentValue = self.evaluator.evaluate_objfun(sol)
         
         return sol
+
+
+    def _update_frequency_counter(self, sol: ScQbfSolution):
+        if self.config["diversification_method"] == "infrequent_elements":
+            for elem in sol.elements:
+                self.frequecy[elem] += 1 if self.frequecy[elem] < self.freq_threshold else 0
