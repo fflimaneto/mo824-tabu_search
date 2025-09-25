@@ -13,8 +13,9 @@ class ScQbfTabuSearch:
     def __init__(self, instance: ScQbfInstance,
                  max_iterations,
                  config: dict = {
-                    "local_search_method": "best_improve",  # best_improve | first_improve
-                    "diversification_method": "none",  # none | infrequent_elements
+                    "local_search_method": "best_improve",  # best_improve | first_improve | probabilistic
+                    "diversification_method": "none",  # none | infrequent_elements,
+                    "probabilistic_weighted": False  # True | False
                  },
                  time_limit_secs: float = None,
                  tenure: int = None,
@@ -172,7 +173,123 @@ class ScQbfTabuSearch:
             return self._local_search_best_improve(starting_point)
         elif self.config.get("local_search_method", False) == "first_improve":
             return self._local_search_first_improve(starting_point)
+        elif self.config.get("local_search_method", False) == "probabilistic":
+            return self._local_search_probabilistic(starting_point)
+        
+    def _local_search_probabilistic(self, starting_point: ScQbfSolution) -> ScQbfSolution:
+        sol = ScQbfSolution(starting_point.elements.copy())
+        cl = [i for i in range(self.instance.n) if i not in sol.elements]
+        current_elements = sol.elements.copy()
+        neighborhoods = ['insertion', 'removal', 'exchange']
 
+        # Shuffle neighborhoods, candidates and current_elements
+        random.shuffle(neighborhoods)
+        random.shuffle(cl)
+        random.shuffle(current_elements)
+
+        # Set number of samples per neighborhood to be selected
+        sample_size = min(25, len(cl))
+
+        # Generate sampled candidates and save valid moves
+        moves = []
+        for neighborhood in neighborhoods:
+            if neighborhood == 'insertion':
+                # Get sample of candidates to insert
+                sampled_in = random.sample(cl, sample_size) if len(cl) > sample_size else cl
+                for cand_in in sampled_in:
+                    # Evaluate insertions
+                    delta = self.evaluator.evaluate_insertion_delta(cand_in, sol)
+                    valid_move = (cand_in not in self.TL or self.currentValue + delta > self.bestValue)
+                    if valid_move:
+                        moves.append({
+                            'neighborhood': neighborhood,
+                            'elem_in': cand_in,
+                            'elem_out': None,
+                            'delta': delta
+                        })
+            if neighborhood == 'removal':
+                # Get sample of candidates to remove
+                sampled_out = random.sample(current_elements, sample_size) if len(current_elements) > sample_size else current_elements
+                for cand_out in sampled_out:
+                    # Evaluate removals
+                    delta = self.evaluator.evaluate_removal_delta(cand_out, sol)
+                    valid_move = (cand_out not in self.TL or self.currentValue + delta > self.bestValue)
+                    temp_sol = ScQbfSolution(sol.elements.copy())
+                    temp_sol.elements.remove(cand_out)
+                    # Check if this removal would break feasibility
+                    if valid_move and self.evaluator.is_solution_valid(temp_sol):
+                        moves.append({
+                            'neighborhood': neighborhood,
+                            'elem_in': None,
+                            'elem_out': cand_out,
+                            'delta': delta
+                        })
+            if neighborhood == 'exchange':
+                # Get sample of candidates to exchange
+                sampled_in = random.sample(cl, sample_size) if len(cl) > sample_size else cl
+                sampled_out = random.sample(current_elements, sample_size) if len(current_elements) > sample_size else current_elements
+                for cand_in in sampled_in:
+                    for cand_out in sampled_out:
+                        # Evaluate exchanges
+                        delta = self.evaluator.evaluate_exchange_delta(cand_in, cand_out, sol)
+                        valid_move = ((cand_in not in self.TL and cand_out not in self.TL) or self.currentValue + delta > self.bestValue)
+                        temp_sol = ScQbfSolution(sol.elements.copy())
+                        temp_sol.elements.remove(cand_out)
+                        temp_sol.elements.append(cand_in)
+                        # Check if this exchange would break feasibility
+                        if valid_move and self.evaluator.is_solution_valid(temp_sol):
+                            moves.append({
+                                'neighborhood': neighborhood,
+                                'elem_in': cand_in,
+                                'elem_out': cand_out,
+                                'delta': delta
+                            })
+
+        if not moves:
+            return sol
+
+        # Choose a random move (can be probabilistic or totally random)
+        if self.config.get("probabilistic_weighted", False):
+            # Weighted sampling based on positive deltas
+            deltas = [max(0, m['delta']) for m in moves]
+            total = sum(deltas)
+            if total > 0:
+                # Calc probabilities
+                probs = [d / total for d in deltas]
+                idx = random.choices(range(len(moves)), weights=probs, k=1)[0]
+                move = moves[idx]
+            else:
+                # Choose random move if all deltas are non-positive
+                move = random.choice(moves)
+        else:
+            # Random choice among all valid moves
+            move = random.choice(moves)
+
+        # Apply the chosen move and update the Tabu List
+        neighborhood = move['neighborhood']
+        cand_in = move['elem_in']
+        cand_out = move['elem_out']
+        delta = move['delta']
+
+        if cand_in is not None:
+            sol.elements.append(cand_in)
+            self.TL.append(cand_in)
+        else:
+            self.TL.append(self.FAKE)
+
+        if cand_out is not None:
+            sol.elements.remove(cand_out)
+            self.TL.append(cand_out)
+        else:
+            self.TL.append(self.FAKE)
+
+        self.TL = self.TL[2:]
+        self.currentValue = self.evaluator.evaluate_objfun(sol)
+
+        if self.debug:
+            print(f"[local_search_probabilistic]: Move: {neighborhood}, in: {cand_in}, out: {cand_out}, delta: {delta:.3f}")
+
+        return sol
 
     def _local_search_best_improve(self, starting_point: ScQbfSolution) -> ScQbfSolution:
         sol = ScQbfSolution(starting_point.elements.copy())
