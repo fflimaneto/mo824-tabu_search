@@ -101,11 +101,12 @@ class ScQbfTabuSearch:
                     # Adds the infrequent elements to the best solution and the Tabu List in a random order
                     sol.elements = best_sol.elements.copy()
                     for e in infrequent_elements:
-                        sol.elements.append(e)
+                        if e not in sol.elements:
+                            sol.elements.append(e)
                         self.TL.append(e)
                         self.TL.append(self.FAKE)
                     self.TL = self.TL[-2*self.tenure:]
-
+                    self.currentValue = self.evaluator.evaluate_objfun(sol)
 
                 current_patience = self.patience
                 for i in range(self.instance.n):
